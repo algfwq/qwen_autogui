@@ -2,6 +2,7 @@ import json
 import base64
 import time
 import io
+import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
@@ -11,6 +12,42 @@ import mss.tools
 import pyautogui
 from PIL import Image
 from openai import OpenAI
+
+system_prompt = """你是一个电脑操作助手。你的任务是根据用户的指令，通过一系列操作来完成用户的任务。
+
+每次响应必须返回一个 JSON 对象，格式如下：
+{
+    "thought": "你的思考过程，分析当前屏幕状态和下一步该做什么",
+    "action": "动作类型",
+    "parameters": {
+        "参数 1": "值 1",
+        "参数 2": "值 2"
+    }
+}
+
+可用的动作类型：
+- click: 点击，参数：x, y (0-1000 的归一化坐标)
+- double_click: 双击，参数：x, y
+- right_click: 右键点击，参数：x, y
+- type: 输入文本，参数：text (要输入的文本)
+- press: 按键，参数：keys (按键数组，如 ["ctrl", "c"])
+- scroll: 滚动，参数：amount (滚动量), x, y (可选，滚动位置)
+- drag: 拖拽，参数：start_x, start_y, end_x, end_y, duration (可选)
+- move: 移动鼠标，参数：x, y, duration (可选)
+- wait: 等待，参数：seconds
+- run_command: 运行终端命令，参数：command (命令字符串), shell (可选，默认 true), timeout (可选，超时秒数，默认 30)
+- task_complete: 任务完成，参数：result (任务结果描述), summary (可选，任务总结，包括执行步骤和最终答案)
+
+注意：
+1. 坐标系统使用 1000x1000 的归一化坐标，(0,0) 是左上角，(1000,1000) 是右下角
+2. 每次只执行一个动作
+3. 仔细观察屏幕内容，做出合理的决策
+4. 如果任务完成，使用 task_complete 动作，并在 summary 中提供完整的任务总结或用户需要的答案
+5. 如果遇到困难，尝试不同的方法
+6. VSCode 打开控制台的快捷键是 ctrl+shift+`
+7. window 电脑用 Set-Content -Encoding utf8 文件名 "内容" 来写文件
+8. task_complete 的 summary 字段应包含：执行的主要步骤、最终结果、以及用户需要的具体答案（如果有）
+"""
 
 
 @dataclass
@@ -49,7 +86,8 @@ class ScreenAgent:
             print(f"Max iterations: {self.max_iterations}")
 
         self.conversation_history: List[Dict[str, Any]] = []
-    
+        self.task_summary: Optional[str] = None
+
     def capture_screen(self) -> str:
         """截取屏幕并返回 base64 编码的图片"""
         with mss.mss() as sct:
@@ -166,8 +204,39 @@ class ScreenAgent:
                 time.sleep(seconds)
                 return f"Waited for {seconds} seconds"
 
+            elif action_type == "run_command":
+                command = params.get("command", "")
+                shell = params.get("shell", True)
+                timeout = params.get("timeout", 30)
+                try:
+                    result = subprocess.run(
+                        command,
+                        shell=shell,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        encoding="utf-8",
+                        errors="replace"
+                    )
+                    output = result.stdout.strip()
+                    error = result.stderr.strip()
+                    return_code = result.returncode
+                    response = f"Command: {command}\nReturn code: {return_code}"
+                    if output:
+                        response += f"\nOutput:\n{output}"
+                    if error:
+                        response += f"\nError:\n{error}"
+                    return response
+                except subprocess.TimeoutExpired:
+                    return f"Command timed out after {timeout} seconds: {command}"
+                except Exception as e:
+                    return f"Error executing command: {str(e)}"
+
             elif action_type == "task_complete":
-                return "Task completed successfully"
+                result = params.get("result", "Task completed")
+                summary = params.get("summary", result)
+                self.task_summary = summary
+                return f"Result: {result}\nSummary: {summary}"
             
             else:
                 return f"Unknown action type: {action_type}"
@@ -193,39 +262,6 @@ class ScreenAgent:
     
     def run(self, task: str) -> str:
         """运行 Agent 完成用户任务"""
-        system_prompt = """你是一个电脑操作助手。你的任务是根据用户的指令，通过一系列操作来完成用户的任务。
-
-每次响应必须返回一个 JSON 对象，格式如下：
-{
-    "thought": "你的思考过程，分析当前屏幕状态和下一步该做什么",
-    "action": "动作类型",
-    "parameters": {
-        "参数 1": "值 1",
-        "参数 2": "值 2"
-    }
-}
-
-可用的动作类型：
-- click: 点击，参数：x, y (0-1000 的归一化坐标)
-- double_click: 双击，参数：x, y
-- right_click: 右键点击，参数：x, y
-- type: 输入文本，参数：text (要输入的文本)
-- press: 按键，参数：keys (按键数组，如 ["ctrl", "c"])
-- scroll: 滚动，参数：amount (滚动量), x, y (可选，滚动位置)
-- drag: 拖拽，参数：start_x, start_y, end_x, end_y, duration (可选)
-- move: 移动鼠标，参数：x, y, duration (可选)
-- wait: 等待，参数：seconds
-- task_complete: 任务完成，参数：result (任务结果描述)
-
-注意：
-1. 坐标系统使用 1000x1000 的归一化坐标，(0,0) 是左上角，(1000,1000) 是右下角
-2. 每次只执行一个动作
-3. 仔细观察屏幕内容，做出合理的决策
-4. 如果任务完成，使用 task_complete 动作
-5. 如果遇到困难，尝试不同的方法
-6. VSCode打开控制台的快捷键是 ctrl+shift+`
-7. window电脑用 Set-Content -Encoding utf8 文件名 "内容" 来写文件
-"""
 
         self.conversation_history = [
             {"role": "system", "content": system_prompt}
@@ -293,6 +329,9 @@ class ScreenAgent:
                 print(f"\n{'='*60}")
                 print("Task completed!")
                 print(f"{'='*60}")
+                if self.task_summary:
+                    print(f"\n📋 任务总结:\n{self.task_summary}")
+                print(f"\n{'='*60}\n")
                 return result
             
             time.sleep(self.delay)
