@@ -1,6 +1,7 @@
 import json
 import base64
 import time
+import io
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 import mss
 import mss.tools
 import pyautogui
+from PIL import Image
 from openai import OpenAI
 
 
@@ -22,7 +24,7 @@ class ScreenAgent:
     def __init__(self, config_path: str = "config.json"):
         with open(config_path, "r", encoding="utf-8") as f:
             self.config = json.load(f)
-        
+
         api_config = self.config["api"]
         self.client = OpenAI(
             base_url=api_config["base_url"],
@@ -31,13 +33,21 @@ class ScreenAgent:
         self.model = api_config["model"]
         self.max_tokens = api_config["max_tokens"]
         self.temperature = api_config["temperature"]
-        
+
         self.max_iterations = self.config["agent"]["max_iterations"]
         self.delay = self.config["agent"]["delay_between_actions"]
-        
+
+        # 配置 pyautogui：禁用内置延迟（我们自己控制），关闭失败安全保护
+        pyautogui.PAUSE = 0.1  # 设置操作间基础延迟
+        pyautogui.FAILSAFE = False  # 禁用鼠标移到角落退出的安全保护
+
         self.screen_width, self.screen_height = pyautogui.size()
         print(f"Screen resolution: {self.screen_width}x{self.screen_height}")
-        
+        if self.max_iterations == -1:
+            print("Max iterations: unlimited")
+        else:
+            print(f"Max iterations: {self.max_iterations}")
+
         self.conversation_history: List[Dict[str, Any]] = []
     
     def capture_screen(self) -> str:
@@ -45,7 +55,15 @@ class ScreenAgent:
         with mss.mss() as sct:
             monitor = sct.monitors[1]
             screenshot = sct.grab(monitor)
-            img_data = mss.tools.to_png(screenshot.rgb, screenshot.size)
+            
+            # 转换为 PIL Image 并使用 JPEG 压缩
+            img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+            
+            # 使用 JPEG 格式，质量 85，控制在 10MB 以内
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=85, optimize=True)
+            img_data = buffer.getvalue()
+            
             return base64.b64encode(img_data).decode("utf-8")
     
     def map_coordinates(self, x: float, y: float) -> tuple[int, int]:
@@ -58,27 +76,49 @@ class ScreenAgent:
         """执行 AI 返回的动作"""
         action_type = action.action_type.lower()
         params = action.parameters
-        
+
         try:
             if action_type == "click":
                 x, y = self.map_coordinates(params.get("x", 500), params.get("y", 500))
-                pyautogui.click(x, y)
+                # 确保坐标在屏幕范围内
+                x, y = max(0, min(x, self.screen_width - 1)), max(0, min(y, self.screen_height - 1))
+                # 先移动鼠标到目标位置，再点击
+                pyautogui.moveTo(x, y, duration=0.3)
+                time.sleep(0.1)
+                pyautogui.click(button='left')
+                time.sleep(0.1)
                 return f"Clicked at ({x}, {y})"
-            
+
             elif action_type == "double_click":
                 x, y = self.map_coordinates(params.get("x", 500), params.get("y", 500))
-                pyautogui.doubleClick(x, y)
+                x, y = max(0, min(x, self.screen_width - 1)), max(0, min(y, self.screen_height - 1))
+                # 先移动鼠标到目标位置，再双击
+                pyautogui.moveTo(x, y, duration=0.3)
+                time.sleep(0.1)
+                pyautogui.doubleClick(button='left')
+                time.sleep(0.1)
                 return f"Double clicked at ({x}, {y})"
-            
+
             elif action_type == "right_click":
                 x, y = self.map_coordinates(params.get("x", 500), params.get("y", 500))
-                pyautogui.rightClick(x, y)
+                x, y = max(0, min(x, self.screen_width - 1)), max(0, min(y, self.screen_height - 1))
+                # 先移动鼠标到目标位置，再右键
+                pyautogui.moveTo(x, y, duration=0.3)
+                time.sleep(0.1)
+                pyautogui.rightClick()
+                time.sleep(0.1)
                 return f"Right clicked at ({x}, {y})"
             
             elif action_type == "type":
                 text = params.get("text", "")
-                interval = 0.1
-                pyautogui.typewrite(text, interval=interval)
+                # 使用更可靠的输入方式，逐个字符输入
+                for char in text:
+                    try:
+                        pyautogui.press(char)
+                    except Exception:
+                        # 如果 press 失败，尝试使用 typewrite
+                        pyautogui.typewrite(char, interval=0.05)
+                    time.sleep(0.05)
                 return f"Typed: {text}"
             
             elif action_type == "press":
@@ -102,22 +142,30 @@ class ScreenAgent:
             elif action_type == "drag":
                 start_x, start_y = self.map_coordinates(params.get("start_x", 500), params.get("start_y", 500))
                 end_x, end_y = self.map_coordinates(params.get("end_x", 500), params.get("end_y", 500))
+                # 确保坐标在屏幕范围内
+                start_x, start_y = max(0, min(start_x, self.screen_width - 1)), max(0, min(start_y, self.screen_height - 1))
+                end_x, end_y = max(0, min(end_x, self.screen_width - 1)), max(0, min(end_y, self.screen_height - 1))
                 duration = params.get("duration", 1.0)
                 pyautogui.moveTo(start_x, start_y)
-                pyautogui.drag(end_x - start_x, end_y - start_y, duration=duration)
+                pyautogui.mouseDown()
+                pyautogui.moveTo(end_x, end_y, duration=duration)
+                pyautogui.mouseUp()
+                time.sleep(0.1)
                 return f"Dragged from ({start_x}, {start_y}) to ({end_x}, {end_y})"
-            
+
             elif action_type == "move":
                 x, y = self.map_coordinates(params.get("x", 500), params.get("y", 500))
+                x, y = max(0, min(x, self.screen_width - 1)), max(0, min(y, self.screen_height - 1))
                 duration = params.get("duration", 0.5)
-                pyautogui.moveTo(x, y, duration=duration)
+                pyautogui.moveTo(x=x, y=y, duration=duration)
+                time.sleep(0.1)
                 return f"Moved to ({x}, {y})"
             
             elif action_type == "wait":
                 seconds = params.get("seconds", 1.0)
                 time.sleep(seconds)
                 return f"Waited for {seconds} seconds"
-            
+
             elif action_type == "task_complete":
                 return "Task completed successfully"
             
@@ -175,7 +223,7 @@ class ScreenAgent:
 3. 仔细观察屏幕内容，做出合理的决策
 4. 如果任务完成，使用 task_complete 动作
 5. 如果遇到困难，尝试不同的方法
-6. VSCode打开控制台的快捷键是 ctrl+shfit+`
+6. VSCode打开控制台的快捷键是 ctrl+shift+`
 7. window电脑用 Set-Content -Encoding utf8 文件名 "内容" 来写文件
 """
 
@@ -186,11 +234,14 @@ class ScreenAgent:
         print(f"\n{'='*60}")
         print(f"Starting task: {task}")
         print(f"{'='*60}\n")
-        
+
         iteration = 0
-        while iteration < self.max_iterations:
+        while self.max_iterations == -1 or iteration < self.max_iterations:
             iteration += 1
-            print(f"\n--- Iteration {iteration}/{self.max_iterations} ---")
+            if self.max_iterations != -1:
+                print(f"\n--- Iteration {iteration}/{self.max_iterations} ---")
+            else:
+                print(f"\n--- Iteration {iteration} ---")
             
             screenshot_base64 = self.capture_screen()
             print("Captured screenshot")
@@ -202,7 +253,7 @@ class ScreenAgent:
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/png;base64,{screenshot_base64}"
+                            "url": f"data:image/jpeg;base64,{screenshot_base64}"
                         }
                     }
                 ]
@@ -246,7 +297,10 @@ class ScreenAgent:
             
             time.sleep(self.delay)
         
-        print("\nMax iterations reached without completing the task")
+        if self.max_iterations != -1:
+            print("\nMax iterations reached without completing the task")
+        else:
+            print("\nTask interrupted without completing")
         return "Task incomplete - max iterations reached"
 
 
