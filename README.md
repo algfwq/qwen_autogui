@@ -46,7 +46,6 @@ python agent.py
 | 操作 | 说明 |
 |------|------|
 | click | 点击指定位置（有移动动画） |
-| instant_click | 瞬间点击指定位置（无动画，**仅限菜单关闭导致点击失效时使用**） |
 | double_click | 双击 |
 | right_click | 右键点击 |
 | type | 输入文本 |
