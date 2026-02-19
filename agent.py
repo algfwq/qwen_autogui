@@ -3,6 +3,9 @@ import base64
 import time
 import io
 import subprocess
+import sys
+import ctypes
+import os
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
@@ -10,6 +13,7 @@ from dataclasses import dataclass
 import mss
 import mss.tools
 import pyautogui
+import pyperclip
 from PIL import Image
 from openai import OpenAI
 
@@ -73,10 +77,8 @@ class ScreenAgent:
 
         self.max_iterations = self.config["agent"]["max_iterations"]
         self.delay = self.config["agent"]["delay_between_actions"]
-
-        # 配置 pyautogui：禁用内置延迟（我们自己控制），关闭失败安全保护
-        pyautogui.PAUSE = 0.1  # 设置操作间基础延迟
-        pyautogui.FAILSAFE = False  # 禁用鼠标移到角落退出的安全保护
+        pyautogui.PAUSE = 0.1
+        pyautogui.FAILSAFE = False
 
         self.screen_width, self.screen_height = pyautogui.size()
         print(f"Screen resolution: {self.screen_width}x{self.screen_height}")
@@ -87,21 +89,26 @@ class ScreenAgent:
 
         self.conversation_history: List[Dict[str, Any]] = []
         self.task_summary: Optional[str] = None
+    
+    def _check_admin_privilege(self) -> bool:
+        """检查是否以管理员权限运行"""
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            return False
 
     def capture_screen(self) -> str:
         """截取屏幕并返回 base64 编码的图片"""
         with mss.mss() as sct:
             monitor = sct.monitors[1]
             screenshot = sct.grab(monitor)
-            
-            # 转换为 PIL Image 并使用 JPEG 压缩
+
             img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-            
-            # 使用 JPEG 格式，质量 85，控制在 10MB 以内
+
             buffer = io.BytesIO()
             img.save(buffer, format="JPEG", quality=85, optimize=True)
             img_data = buffer.getvalue()
-            
+
             return base64.b64encode(img_data).decode("utf-8")
     
     def map_coordinates(self, x: float, y: float) -> tuple[int, int]:
@@ -109,7 +116,7 @@ class ScreenAgent:
         real_x = int(x / 1000 * self.screen_width)
         real_y = int(y / 1000 * self.screen_height)
         return real_x, real_y
-    
+
     def execute_action(self, action: Action) -> str:
         """执行 AI 返回的动作"""
         action_type = action.action_type.lower()
@@ -118,9 +125,7 @@ class ScreenAgent:
         try:
             if action_type == "click":
                 x, y = self.map_coordinates(params.get("x", 500), params.get("y", 500))
-                # 确保坐标在屏幕范围内
                 x, y = max(0, min(x, self.screen_width - 1)), max(0, min(y, self.screen_height - 1))
-                # 先移动鼠标到目标位置，再点击
                 pyautogui.moveTo(x, y, duration=0.3)
                 time.sleep(0.1)
                 pyautogui.click(button='left')
@@ -130,7 +135,6 @@ class ScreenAgent:
             elif action_type == "double_click":
                 x, y = self.map_coordinates(params.get("x", 500), params.get("y", 500))
                 x, y = max(0, min(x, self.screen_width - 1)), max(0, min(y, self.screen_height - 1))
-                # 先移动鼠标到目标位置，再双击
                 pyautogui.moveTo(x, y, duration=0.3)
                 time.sleep(0.1)
                 pyautogui.doubleClick(button='left')
@@ -140,32 +144,31 @@ class ScreenAgent:
             elif action_type == "right_click":
                 x, y = self.map_coordinates(params.get("x", 500), params.get("y", 500))
                 x, y = max(0, min(x, self.screen_width - 1)), max(0, min(y, self.screen_height - 1))
-                # 先移动鼠标到目标位置，再右键
                 pyautogui.moveTo(x, y, duration=0.3)
                 time.sleep(0.1)
                 pyautogui.rightClick()
                 time.sleep(0.1)
                 return f"Right clicked at ({x}, {y})"
-            
+
             elif action_type == "type":
                 text = params.get("text", "")
-                # 使用更可靠的输入方式，逐个字符输入
-                for char in text:
-                    try:
-                        pyautogui.press(char)
-                    except Exception:
-                        # 如果 press 失败，尝试使用 typewrite
-                        pyautogui.typewrite(char, interval=0.05)
-                    time.sleep(0.05)
+                old_clipboard = pyperclip.paste()
+                try:
+                    pyperclip.copy(text)
+                    time.sleep(0.1)
+                    pyautogui.hotkey("ctrl", "v")
+                    time.sleep(0.1)
+                finally:
+                    pyperclip.copy(old_clipboard)
                 return f"Typed: {text}"
-            
+
             elif action_type == "press":
                 keys = params.get("keys", [])
                 if isinstance(keys, str):
                     keys = [keys]
                 pyautogui.hotkey(*keys)
                 return f"Pressed: {'+'.join(keys)}"
-            
+
             elif action_type == "scroll":
                 amount = params.get("amount", 100)
                 x = params.get("x")
@@ -176,11 +179,10 @@ class ScreenAgent:
                 else:
                     pyautogui.scroll(amount)
                 return f"Scrolled: {amount}"
-            
+
             elif action_type == "drag":
                 start_x, start_y = self.map_coordinates(params.get("start_x", 500), params.get("start_y", 500))
                 end_x, end_y = self.map_coordinates(params.get("end_x", 500), params.get("end_y", 500))
-                # 确保坐标在屏幕范围内
                 start_x, start_y = max(0, min(start_x, self.screen_width - 1)), max(0, min(start_y, self.screen_height - 1))
                 end_x, end_y = max(0, min(end_x, self.screen_width - 1)), max(0, min(end_y, self.screen_height - 1))
                 duration = params.get("duration", 1.0)
@@ -198,7 +200,7 @@ class ScreenAgent:
                 pyautogui.moveTo(x=x, y=y, duration=duration)
                 time.sleep(0.1)
                 return f"Moved to ({x}, {y})"
-            
+
             elif action_type == "wait":
                 seconds = params.get("seconds", 1.0)
                 time.sleep(seconds)
@@ -237,13 +239,13 @@ class ScreenAgent:
                 summary = params.get("summary", result)
                 self.task_summary = summary
                 return f"Result: {result}\nSummary: {summary}"
-            
+
             else:
                 return f"Unknown action type: {action_type}"
-        
+
         except Exception as e:
             return f"Error executing action: {str(e)}"
-    
+
     def parse_action(self, response_text: str) -> Optional[Action]:
         """解析 AI 返回的动作"""
         try:
@@ -259,14 +261,14 @@ class ScreenAgent:
         except Exception as e:
             print(f"Error parsing action: {e}")
         return None
-    
+
     def run(self, task: str) -> str:
         """运行 Agent 完成用户任务"""
 
         self.conversation_history = [
             {"role": "system", "content": system_prompt}
         ]
-        
+
         print(f"\n{'='*60}")
         print(f"Starting task: {task}")
         print(f"{'='*60}\n")
@@ -278,10 +280,10 @@ class ScreenAgent:
                 print(f"\n--- Iteration {iteration}/{self.max_iterations} ---")
             else:
                 print(f"\n--- Iteration {iteration} ---")
-            
+
             screenshot_base64 = self.capture_screen()
             print("Captured screenshot")
-            
+
             user_message = {
                 "role": "user",
                 "content": [
@@ -294,9 +296,9 @@ class ScreenAgent:
                     }
                 ]
             }
-            
+
             messages = self.conversation_history + [user_message]
-            
+
             print("Sending to AI...")
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -304,27 +306,27 @@ class ScreenAgent:
                 max_tokens=self.max_tokens,
                 temperature=self.temperature
             )
-            
+
             ai_response = response.choices[0].message.content
             print(f"AI response:\n{ai_response}\n")
-            
+
             self.conversation_history.append(user_message)
             self.conversation_history.append({
                 "role": "assistant",
                 "content": ai_response
             })
-            
+
             action = self.parse_action(ai_response)
             if action is None:
                 print("Failed to parse action, retrying...")
                 continue
-            
+
             print(f"Thought: {action.thought}")
             print(f"Executing action: {action.action_type}")
-            
+
             result = self.execute_action(action)
             print(f"Result: {result}")
-            
+
             if action.action_type.lower() == "task_complete":
                 print(f"\n{'='*60}")
                 print("Task completed!")
@@ -333,9 +335,9 @@ class ScreenAgent:
                     print(f"\n📋 任务总结:\n{self.task_summary}")
                 print(f"\n{'='*60}\n")
                 return result
-            
+
             time.sleep(self.delay)
-        
+
         if self.max_iterations != -1:
             print("\nMax iterations reached without completing the task")
         else:
@@ -345,7 +347,7 @@ class ScreenAgent:
 
 def main():
     agent = ScreenAgent()
-    
+
     task = input("Enter your task: ")
     result = agent.run(task)
     print(f"\nFinal result: {result}")
